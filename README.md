@@ -1,0 +1,727 @@
+# 古茗问数：Schema RAG 与 NL2SQL Agent 技术实现
+
+> 面向古茗门店饮品零售场景的自然语言数据分析系统。业务人员用中文提出问题，系统完成 Schema 检索、指标口径对齐、SQL 生成、SQL 校验与修正、数仓执行，并通过 SSE 把分析过程和结果实时返回前端。
+>
+> 本文聚焦系统当前的技术实现，包括数仓建模、元数据知识库、LangGraph 工作流、混合检索、SQL 闭环、接口协议、前端实现、部署方式与验证结果。
+
+---
+
+## 1. 项目定位与设计目标
+
+### 1.1 要解决的问题
+
+门店饮品零售的分析需求通常集中在订单、营收、会员、商品、渠道和促销几个维度，但业务人员直接写 SQL 存在三个现实问题：
+
+- 不熟悉 9 张表的表结构、字段含义和 Join 路径；
+- 不理解 GMV、销售额、客单价等指标的准确口径；
+- 大模型直接生成 SQL 时容易选错表、编造字段、漏掉订单状态过滤，或者把订单级金额和明细级金额混用。
+
+本项目的核心思路不是“让大模型直接写 SQL”，而是先构建一个可检索的元数据知识库，把与问题相关的表、字段、指标和字段取值召回出来，再让模型在受约束的上下文中完成推理和 SQL 生成，最后通过数据库校验闭环保证 SQL 可执行。
+
+### 1.2 设计原则
+
+| 原则 | 落地方式 |
+| --- | --- |
+| 先检索，后生成 | 字段、指标、取值三路召回，避免把全量 Schema 塞进 Prompt |
+| 结构化上下文 | 表、字段、指标、日期、数据库方言全部整理成稳定结构后再交给模型 |
+| SQL 闭环 | 生成后先 `EXPLAIN` 校验，失败进入修正节点，修正后再次执行 |
+| 过程可观测 | 每个节点通过 SSE 推送 `progress` 事件，前端实时展示执行步骤 |
+| 口径可维护 | 指标定义、字段描述、别名和值域统一放在 `conf/meta_config.yaml` |
+
+### 1.3 能力边界
+
+当前系统支持单轮、只读、单条 SQL 的自然语言问数，覆盖单表查询、多表 Join、时间范围、维度分组、排序 TopN、占比和同环比类问题。暂不支持多轮上下文、图表生成、权限控制和多 SQL 联合分析。
+
+---
+
+## 2. 总体架构
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                        React 前端                            │
+│        聊天输入 / 执行步骤 / SQL 结果表格 / 新会话           │
+└──────────────────────────┬──────────────────────────────────┘
+                           │ POST /api/query (SSE)
+┌──────────────────────────▼──────────────────────────────────┐
+│                      FastAPI 后端                            │
+│   QueryService → LangGraph 工作流 → SSE 事件流               │
+└───────┬──────────────────┬──────────────────┬────────────────┘
+        │                  │                  │
+        ▼                  ▼                  ▼
+   Qdrant 向量库      Elasticsearch       MySQL
+   ├ 字段向量          └ 字段取值全文索引   ├ meta：元数据
+   └ 指标向量                              └ dw：分析数仓
+        ▲                  ▲                  ▲
+        └──────────────────┴──────────────────┘
+                离线元数据知识库构建
+```
+
+系统由两条链路组成：
+
+| 链路 | 输入 | 处理 | 输出 |
+| --- | --- | --- | --- |
+| 离线知识库构建 | `conf/meta_config.yaml` + 数仓真实结构 | 表字段入库、字段/指标向量化、字段取值全文索引 | Meta MySQL、Qdrant、Elasticsearch |
+| 在线自然语言问数 | 用户中文问题 | 关键词抽取、三路召回、上下文合并过滤、SQL 生成校验执行 | SSE 进度事件 + 查询结果 |
+
+### 2.1 技术栈
+
+| 模块 | 技术 | 职责 |
+| --- | --- | --- |
+| 分析数仓 | MySQL 8.0 | 7 张维度表 + 2 张事实表 |
+| 元数据库 | MySQL + SQLAlchemy | 表、字段、指标、字段指标关系 |
+| 向量检索 | Qdrant | 字段和指标的语义召回 |
+| 全文检索 | Elasticsearch 8.19 + IK | 字段真实取值的中文检索 |
+| Embedding | TEI + `BAAI/bge-large-zh-v1.5` | 1024 维文本向量 |
+| Agent 编排 | LangGraph | 12 节点工作流与条件分支 |
+| 模型接入 | LangChain + DeepSeek | 关键词扩展、过滤、SQL 生成与修正 |
+| 后端 | FastAPI | 查询接口、依赖注入、生命周期管理 |
+| 流式协议 | SSE | 节点进度、结果和错误推送 |
+| 前端 | React 19 + Vite 6 + TypeScript + Tailwind CSS | 聊天式问数界面与流程展示 |
+| 日志 | loguru + ContextVar | request_id 链路追踪 |
+
+---
+
+## 3. 数据仓库设计
+
+### 3.1 星型模型
+
+数仓共 9 张表、71 个字段，采用星型模型：
+
+| 表 | 类型 | 粒度 | 字段数 | 主要职责 |
+| --- | --- | --- | --- | --- |
+| `dim_region` | 维度 | 城市 | 5 | 省份、城市、城市等级、大区 |
+| `dim_store` | 维度 | 门店 | 7 | 门店名称、所属区域、经营类型、开业日期、营业状态 |
+| `dim_product` | 维度 | 饮品 SKU | 9 | 饮品名称、品类、系列、杯型、售价、成本、上市日期 |
+| `dim_member` | 维度 | 会员 | 7 | 性别、年龄段、茗星等级、注册日期、注册门店 |
+| `dim_channel` | 维度 | 渠道 | 4 | 到店自提、小程序外卖、美团外卖、饿了么外卖 |
+| `dim_promotion` | 维度 | 活动 | 8 | 折扣、满减、第二杯半价、买一送一、特价、赠品 |
+| `dim_date` | 维度 | 日期 | 9 | 年、季度、月、星期、是否周末 |
+| `fact_order` | 事实 | 订单 | 12 | 门店、会员、日期、渠道、活动、原价、优惠、实收、杯数、状态 |
+| `fact_order_item` | 事实 | 订单明细 | 10 | 订单、商品、杯数、单价、明细金额、糖度、冰量、小料 |
+
+### 3.2 双粒度事实表
+
+`fact_order` 一行一个订单，`fact_order_item` 一行一个饮品 SKU。两张事实表承担不同的分析职责：
+
+- **订单粒度**：GMV、订单量、客单价、折扣金额、折扣率、会员订单占比、退款率等；
+- **明细粒度**：销售额、出杯量、杯单价、新品销量占比、毛利率、糖度/冰量/小料分布等。
+
+这个设计带来的关键约束是：**订单表与明细表 Join 后，不能对订单级金额字段求和**。一个订单包含多条明细时，订单级金额会在 Join 结果中重复出现。因此：
+
+- 订单维度的营收使用 `fact_order.actual_amount`；
+- 饮品、品类等明细维度的销售额使用 `fact_order_item.item_amount`；
+- Prompt 中单独加入扇出约束，指标配置也把两个口径拆成独立指标。
+
+### 3.3 业务语义建模
+
+数仓直接使用古茗的业务口径，而不是通用零售字段：
+
+| 维度 | 取值设计 |
+| --- | --- |
+| 会员等级 | 潜力茗星、人气茗星、当红茗星、顶流茗星，对应葫芦门槛 3 / 8 / 20 |
+| 门店类型 | 直营店、加盟店 |
+| 渠道 | 到店自提、小程序外卖、美团外卖、饿了么外卖 |
+| 糖度 | 十分甜、七分甜、五分甜、三分甜、微糖 |
+| 冰量 | 正常冰、少冰、去冰、温、热 |
+| 小料 | 无、珍珠、椰果、多肉、芋圆、芋泥、奶盖、西米 |
+| 产品系列 | 超A芝士家族、云岭茉莉家族、轻乳茶家族、鲜果茶家族、纯茶家族、咖啡家族、经典奶茶家族、季节限定、轻负担系列 |
+| 促销活动 | 周三会员日、新春满30减5、第二杯半价、情人节买一送一、9.9元喝新品、葫芦兑好礼等 |
+
+这些取值同时写入维度表、字段描述、字段别名和 ES 值域索引，保证用户说“顶流茗星”“多肉”“到店自提”时，系统能定位到正确的字段和值。
+
+### 3.4 模拟数据规模
+
+数据生成脚本为 `app/scripts/seed_guming_dw.py`，固定随机种子 `20250101`，时间范围 2025-01-01 至 2025-03-31：
+
+| 数据 | 规模 |
+| --- | --- |
+| 大区 / 城市 | 5 个大区，28 个城市 |
+| 门店 | 50 家（直营店 2、加盟店 48） |
+| 饮品 SKU | 40 款 |
+| 会员 | 3,000 人（潜力 1,801 / 人气 752 / 当红 359 / 顶流 88） |
+| 渠道 | 4 个 |
+| 促销活动 | 10 个 |
+| 日期 | 90 天 |
+| 订单 | 48,409 |
+| 订单明细 | 70,802 |
+| 全量 GMV | 1,308,418.15 元 |
+
+生成逻辑包含门店热度差异、周末与月度波动、会员金字塔分布、口味偏好和订单状态分布，使查询结果具有业务含义，而不是纯随机噪声。
+
+### 3.5 指标口径
+
+`conf/meta_config.yaml` 定义了 16 个指标：
+
+| 指标 | 口径 |
+| --- | --- |
+| GMV | 已完成订单的 `actual_amount` 合计 |
+| 销售额 | 已完成订单的 `fact_order_item.item_amount` 合计，明细维度使用 |
+| 订单量 | 已完成订单的 `order_id` 去重计数 |
+| 客单价 | GMV / 订单量 |
+| 出杯量 | 已完成订单的 `item_count` 或明细 `quantity` 合计 |
+| 杯单价 | GMV / 出杯量 |
+| 折扣金额 | 已完成订单的 `discount_amount` 合计 |
+| 折扣率 | 折扣金额 / 原价金额 `order_amount` 合计 |
+| 会员订单占比 | 会员订单数 / 全部已完成订单数 |
+| 会员复购率 | 下单 ≥2 次的会员数 / 有下单的会员数 |
+| 单店日均营收 | GMV / 产生订单的门店数 / 统计天数 |
+| 新品销量占比 | 统计期内上市新品的杯量 / 全部杯量 |
+| 退款率 | 已退款订单数 / 全部订单数 |
+| 毛利率 | (GMV − 商品成本) / GMV |
+| 营业门店数 | 统计期内产生已完成订单的门店去重数 |
+| 消费会员数 | 统计期内产生已完成订单的会员去重数 |
+
+指标不仅包含名称，还包含描述、别名和依赖字段。依赖字段用于在召回阶段补齐“指标怎么算”所需的真实列，避免模型知道指标名却不知道用哪一列。
+
+---
+
+## 4. 元数据知识库
+
+元数据知识库是 Schema RAG 的数据基础，分布在三类存储中。
+
+### 4.1 Meta MySQL：结构化元数据
+
+| 表 | 行数 | 内容 |
+| --- | --- | --- |
+| `table_info` | 9 | 表名、表角色（dim/fact）、表描述 |
+| `column_info` | 71 | 字段名、类型、角色、示例值、描述、别名、所属表 |
+| `metric_info` | 16 | 指标名、描述、别名、依赖字段 |
+| `column_metric` | 45 | 指标与字段的多对多依赖关系 |
+
+字段 ID 统一使用 `表名.字段名` 的形式，例如 `fact_order.actual_amount`。这个 ID 同时贯穿 Meta MySQL、Qdrant payload 和 ES 文档，保证三路召回结果可以按同一主键合并。
+
+### 4.2 Qdrant：字段与指标向量
+
+| Collection | 向量数 | 内容 |
+| --- | --- | --- |
+| `column_info_collection` | 361 | 字段名、字段描述、字段别名 |
+| `metric_info_collection` | 89 | 指标名、指标描述、指标别名 |
+
+向量维度 1024，距离度量 Cosine。一个字段不会只生成一个向量点，而是把名称、描述和每个别名分别作为一个语义入口：
+
+```text
+fact_order.actual_amount
+├── "actual_amount"        → 字段名向量
+├── "实收金额，订单实际..." → 描述向量
+├── "实收金额"              → 别名向量
+├── "实付金额"              → 别名向量
+└── "成交金额"              → 别名向量
+```
+
+这样用户说“成交额”“实收”“收入”时，都有机会命中同一个字段。指标采用相同的拆分策略。
+
+检索时使用 `score_threshold=0.6`、`limit=20`，每个扩展关键词单独检索，再按字段 ID 或指标 ID 去重。
+
+### 4.3 Elasticsearch：字段取值
+
+低基数业务字段的真实取值写入 ES `value_index`：
+
+- 索引字段：`id`、`value`、`column_id`；
+- `value` 使用 `ik_max_word` 分词，适合中文地区、门店名、会员等级、品类等取值；
+- 查询使用 `match`，`min_score=0.6`，`size=20`；
+- 当前写入 234 条取值文档，覆盖 26 个允许同步的字段。
+
+字段是否同步由 `meta_config.yaml` 中每个字段的 `sync: true/false` 控制。高基数、无枚举意义的字段（如订单号、金额）不进入值域索引，避免索引膨胀。
+
+### 4.4 知识库构建流程
+
+构建入口：
+
+```bash
+uv run python -m app.scripts.build_meta_knowledge -c conf/meta_config.yaml
+```
+
+流程：
+
+1. 读取 `meta_config.yaml`，解析表、字段、指标和同步开关；
+2. 到数仓读取字段真实类型和少量示例值，写入 `table_info`、`column_info`；
+3. 字段按名称、描述、别名拆成向量点，分批调用 Embedding 服务写入 Qdrant；
+4. 对 `sync` 字段读取真实值全集，写入 ES `value_index`；
+5. 指标及字段依赖写入 `metric_info`、`column_metric`，再向量化写入 Qdrant。
+
+Embedding 按 20 条一批调用，Qdrant 按 10 条一批 upsert，ES 按 20 条一批 bulk，避免单次请求过大。
+
+**构建是追加写，不是幂等重建**。修改配置或重建数仓后，必须先清空四类存储，再执行构建：
+
+```bash
+# Meta MySQL
+DELETE FROM column_metric;
+DELETE FROM column_info;
+DELETE FROM metric_info;
+DELETE FROM table_info;
+
+# Qdrant
+curl -X DELETE http://localhost:6333/collections/column_info_collection
+curl -X DELETE http://localhost:6333/collections/metric_info_collection
+
+# Elasticsearch
+curl -X DELETE http://localhost:9200/value_index
+```
+
+### 4.5 为什么使用混合检索
+
+| 信息类型 | 检索方式 | 原因 |
+| --- | --- | --- |
+| 字段 | Qdrant 向量 | 用户说“成交额”，字段名可能是 `actual_amount`，需要语义匹配 |
+| 指标 | Qdrant 向量 | “平均每单多少钱”需要映射到“客单价” |
+| 字段取值 | Elasticsearch 全文 | “华东”“顶流茗星”“多肉”是精确业务值，关键词命中更可靠 |
+
+三类信息协同召回，比只做表级检索更接近真实分析流程：模型既知道“有哪些字段”，也知道“指标怎么算”，还知道“条件值怎么写”。
+
+---
+
+## 5. LangGraph 工作流
+
+### 5.1 State 与 Context 分离
+
+工作流使用两个结构：
+
+- `DataAgentState`：节点之间传递的业务数据，包括问题、关键词、三路召回结果、表上下文、指标上下文、日期、数据库信息、SQL 和错误信息；
+- `DataAgentContext`：本次执行复用的外部依赖，包括 MySQL 仓储、Qdrant 仓储、ES 仓储和 Embedding 客户端。
+
+这样 State 只保留可序列化的业务数据，客户端和连接池不进入图状态，便于调试和扩展。
+
+### 5.2 12 个节点
+
+| 节点 | 输入 | 输出 | 职责 |
+| --- | --- | --- | --- |
+| `extract_keywords` | 用户问题 | `keywords` | Jieba TF-IDF + 词性过滤抽取关键词，并保留原问题兜底 |
+| `recall_column` | 关键词 | `retrieved_column_infos` | LLM 扩展字段语义词 → Embedding → Qdrant 检索 → 按字段 ID 去重 |
+| `recall_value` | 关键词 | `retrieved_value_infos` | LLM 扩展值域词 → ES 全文检索 → 按取值 ID 去重 |
+| `recall_metric` | 关键词 | `retrieved_metric_infos` | LLM 扩展指标概念 → Embedding → Qdrant 检索 → 按指标 ID 去重 |
+| `merge_retrieved_info` | 三路召回结果 | `table_infos`、`metric_infos` | 补齐指标依赖字段、字段取值、主外键，按表组织上下文 |
+| `filter_table` | 表上下文 | 裁剪后的 `table_infos` | LLM 选择保留的表和字段，程序按选择结果裁剪 |
+| `filter_metric` | 指标上下文 | 裁剪后的 `metric_infos` | LLM 选择当前问题需要的指标 |
+| `add_extra_context` | 数仓连接 | `date_info`、`db_info` | 补充当前日期、星期、季度、数据库方言和版本 |
+| `generate_sql` | 全部上下文 | `sql` | 按 Prompt 约束生成一条只读 SQL |
+| `validate_sql` | `sql` | `error` | 使用 `EXPLAIN` 校验 SQL 是否可被数据库解析 |
+| `correct_sql` | 原问题、SQL、错误、上下文 | 修正后的 `sql` | 结合完整上下文做最小必要修正 |
+| `run_sql` | `sql` | SSE `result` | 执行 SQL，输出查询结果 |
+
+### 5.3 图拓扑
+
+```text
+START
+  │
+extract_keywords
+  ├──────────────┬──────────────┐
+  ▼              ▼              ▼
+recall_column  recall_value   recall_metric
+  └──────────────┴──────────────┘
+                 ▼
+        merge_retrieved_info
+          ├──────────────┐
+          ▼              ▼
+     filter_table   filter_metric
+          └──────────────┘
+                 ▼
+        add_extra_context
+                 ▼
+           generate_sql
+                 ▼
+           validate_sql
+          ┌──────┴──────┐
+      error 为空      error 非空
+          ▼             ▼
+       run_sql      correct_sql
+          │             │
+          │             ▼
+          │          run_sql
+          └─────────────┘
+                 ▼
+                END
+```
+
+三路召回并行执行，表过滤和指标过滤并行执行；`validate_sql` 通过条件边决定直接执行还是进入修正节点。
+
+### 5.4 节点可观测性
+
+每个节点执行时通过 `runtime.stream_writer` 写出：
+
+```json
+{"type": "progress", "step": "召回字段信息", "status": "running"}
+{"type": "progress", "step": "召回字段信息", "status": "success"}
+```
+
+节点失败时写出 `status: "error"` 并抛出异常，由 `QueryService` 统一包装成 SSE 错误事件。前端据此展示完整的执行步骤。
+
+---
+
+## 6. 检索与上下文组装
+
+### 6.1 关键词抽取
+
+`extract_keywords` 使用 Jieba 的 TF-IDF 关键词抽取，并通过词性白名单过滤噪声：
+
+- 保留名词、地名、机构名、专有名词、动词、名动词、形容词、英文和固定短语；
+- 过滤“的、帮我、一下”等无检索价值的词；
+- 把原始问题本身加入关键词列表，防止分词错误导致语义丢失。
+
+### 6.2 三路语义扩展
+
+每个召回节点都会先用 LLM 把用户问法扩展成该路检索更适合的词：
+
+| 节点 | 扩展目标 | 示例 |
+| --- | --- | --- |
+| 字段召回 | 字段语义 | “销售总额” → “销售金额”“实收金额” |
+| 取值召回 | 真实值表达 | “华北地区” → “华北” |
+| 指标召回 | 指标概念 | “平均每单多少钱” → “客单价”“AOV” |
+
+扩展结果与原关键词合并去重后，再逐词检索。
+
+### 6.3 召回结果合并
+
+`merge_retrieved_info` 是上下文组装的核心节点，执行 7 个步骤：
+
+1. 以 `column_id` 为键合并字段召回结果；
+2. 遍历指标依赖字段，缺失的从 Meta MySQL 按 ID 补齐；
+3. 把取值召回结果写入对应字段的 `examples`，帮助模型写出真实条件值；
+4. 按 `table_id` 把字段归到各自表下；
+5. 为每张候选表补齐主外键字段，保证 Join 路径完整；
+6. 把字段实体转换成面向 Prompt 的 `TableInfoState`；
+7. 把指标实体转换成 `MetricInfoState`，保留名称、描述、别名和依赖字段。
+
+主外键通常不会出现在用户问题里，单靠向量召回容易漏掉，因此在合并阶段统一兜底补齐。
+
+### 6.4 两阶段过滤
+
+召回阶段追求“不漏”，过滤阶段追求“不噪”：
+
+- `filter_table`：把候选表结构转成 YAML 交给 LLM，模型只返回“保留哪些表、每张表保留哪些字段”的 JSON；
+- `filter_metric`：模型只返回需要保留的指标名称；
+- 程序根据模型的选择结果从原始结构中裁剪，**不让模型重写复杂结构**，避免 JSON 结构漂移或字段丢失。
+
+### 6.5 额外上下文
+
+`add_extra_context` 补充两类模型必须知道、但不来自召回的信息：
+
+- 当前日期、星期、季度：支持“今天”“本月”“本季度”“最近 30 天”等相对时间；
+- 数据库方言和版本：影响日期函数、`LIMIT` 语法和函数名。
+
+---
+
+## 7. SQL 生成与执行闭环
+
+### 7.1 Prompt 约束
+
+`prompts/generate_sql.prompt` 把生成约束写成 10 条硬规则：
+
+1. 只能使用上下文中真实存在的表和字段；
+2. 有指标定义时必须严格遵循业务口径；
+3. 只能生成查询语句，禁止写入、更新、删除；
+4. 语法必须符合数据库方言和版本；
+5. 默认只生成一条 SQL；
+6. 聚合字段和计算字段必须使用 `AS` 起稳定别名；
+7. 订单表与明细表 Join 后按明细维度统计金额时，必须使用明细级金额；
+8. 统计营收、订单量、出杯量、会员等指标时，遵循指标定义中的订单状态过滤；
+9. 金额、单价、客单价、占比使用 `ROUND(..., 2)` 保留两位小数；
+10. 只输出纯 SQL，不使用 Markdown 代码块。
+
+这些规则分别对应实际踩过的错误类型：编造字段、口径偏离、扇出重复计数、未过滤退款订单、小数过长和输出格式不稳定。
+
+### 7.2 校验与修正
+
+`validate_sql` 调用数仓仓储的 `validate()`，内部执行 `EXPLAIN <sql>`。校验只关心数据库能否解析这条 SQL，不执行真实查询。
+
+- 校验通过：`error = None`，条件边进入 `run_sql`；
+- 校验失败：错误信息写入 `state["error"]`，条件边进入 `correct_sql`；
+- 修正节点拿到原问题、原 SQL、数据库错误和完整表/指标上下文，做最小必要修正；
+- 修正后的 SQL 直接进入 `run_sql`，不再二次校验。
+
+### 7.3 扇出重复计数问题
+
+这是双粒度事实表最容易出错的地方。假设一个订单有 3 条明细：
+
+```text
+fact_order.actual_amount = 30 元
+fact_order_item.item_amount = 10 + 10 + 10 元
+```
+
+如果按品类统计时写成：
+
+```sql
+SELECT p.category, SUM(o.actual_amount)
+FROM fact_order o
+JOIN fact_order_item i ON o.order_id = i.order_id
+JOIN dim_product p ON i.product_id = p.product_id
+GROUP BY p.category;
+```
+
+订单的 30 元会在 Join 后重复 3 次，结果被放大。正确写法是使用明细金额：
+
+```sql
+SELECT p.category, SUM(i.item_amount)
+FROM fact_order o
+JOIN fact_order_item i ON o.order_id = i.order_id
+JOIN dim_product p ON i.product_id = p.product_id
+WHERE o.order_status = '已完成'
+GROUP BY p.category;
+```
+
+系统通过三层机制控制这个问题：指标层拆分为“GMV”和“销售额”，Prompt 第 7 条显式约束，字段描述和别名中说明两个金额字段的适用粒度。
+
+### 7.4 结果序列化
+
+MySQL 返回的 `date`、`datetime`、`Decimal` 不能直接被 JSON 序列化。数仓仓储在返回结果前统一调用 `_to_json_value` 转换，保证 SSE 的 `result` 事件可以稳定输出。
+
+---
+
+## 8. API 与流式协议
+
+### 8.1 查询接口
+
+```http
+POST /api/query
+Content-Type: application/json
+
+{"query": "按茗星等级统计 2025 年第一季度的订单量和客单价"}
+```
+
+响应类型为 `text/event-stream`。`QueryService` 创建初始 State 和 Context，消费 `graph.astream(..., stream_mode="custom")`，把每个 chunk 包装成 SSE 消息。
+
+### 8.2 事件类型
+
+| 事件 | 结构 | 用途 |
+| --- | --- | --- |
+| `progress` | `{"type":"progress","step":"生成SQL","status":"running"}` | 节点执行进度 |
+| `result` | `{"type":"result","data":[...]}` | 最终查询结果 |
+| `error` | `{"type":"error","message":"..."}` | 工作流异常 |
+
+SSE 格式：
+
+```text
+data: {"type": "progress", "step": "抽取关键词", "status": "running"}
+
+data: {"type": "progress", "step": "抽取关键词", "status": "success"}
+
+...
+
+data: {"type": "result", "data": [{"茗星等级": "潜力茗星", "订单量": 17752, "客单价": "28.82"}]}
+
+```
+
+流式响应一旦开始，HTTP 状态码不能再修改，因此工作流异常也被包装成 `error` 事件返回，而不是抛出 500。
+
+### 8.3 前端流式解析
+
+前端没有使用 `EventSource`，因为 `EventSource` 只支持 GET，而查询接口需要 POST JSON。实际实现使用 `fetch` + `ReadableStream`：
+
+1. 读取 `response.body.getReader()`；
+2. 用 `TextDecoder` 按 UTF-8 流式解码；
+3. 以 `\n\n` 切分 SSE 消息；
+4. 提取 `data:` 行并 `JSON.parse`；
+5. 根据事件类型更新消息状态。
+
+---
+
+## 9. 前端实现
+
+前端位于 `frontend/`，技术栈为 React 19、Vite 6、TypeScript 和 Tailwind CSS。
+
+### 9.1 组件划分
+
+| 组件 | 职责 |
+| --- | --- |
+| `App.tsx` | 会话状态、SSE 事件消费、消息列表和整体布局 |
+| `Composer.tsx` | 输入框、发送、停止生成 |
+| `EmptyState.tsx` | 空会话状态和 6 个示例问题 |
+| `MessageBubble.tsx` | 用户/助手消息、错误展示、结果表格 |
+| `StepRail.tsx` | LangGraph 节点执行步骤和时间线 |
+| `ResultTable.tsx` | 查询结果表格渲染 |
+| `lib/agentApi.ts` | SSE 请求与解析 |
+| `lib/format.ts` | 结果摘要和格式化 |
+
+### 9.2 状态管理
+
+每条助手消息包含：
+
+```ts
+type ChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  status?: "streaming" | "done" | "error";
+  steps?: StepState[];
+  result?: unknown;
+  error?: string;
+};
+```
+
+收到 `progress` 事件时，按 `step` 更新步骤状态，同一节点重复执行时覆盖旧状态；收到 `result` 时把消息标记为完成并保存结果；收到 `error` 时展示错误信息。请求通过 `AbortController` 支持用户主动停止。
+
+### 9.3 接口代理
+
+开发环境通过 Vite 的 `/api` 代理转发到后端 8000 端口，前端代码不需要写死后端地址。部署时可通过 `VITE_API_BASE_URL` 指向独立的后端域名。
+
+---
+
+## 10. 部署与配置
+
+### 10.1 依赖服务
+
+`docker/docker-compose.yaml` 启动 5 个服务：
+
+| 服务 | 镜像 | 宿主端口 | 用途 |
+| --- | --- | --- | --- |
+| MySQL | `mysql:8.0` | 3307 → 3306 | 元数据库 + 分析数仓 |
+| Elasticsearch | 基于 8.19.10 构建，安装 IK | 9200 | 字段取值全文索引 |
+| Kibana | `kibana:8.19.10` | 5601 | ES 可视化 |
+| Qdrant | `qdrant/qdrant:v1.16` | 6333 / 6334 | 字段和指标向量 |
+| Embedding | `text-embeddings-inference:cpu-1.8` | 8081 → 80 | bge-large-zh-v1.5 推理 |
+
+MySQL 使用命名卷 `mysql_data` 持久化，首次启动执行 `docker/mysql/*.sql` 建库建表并授权。宿主 3307 是为了避开本机已有 MySQL 服务。
+
+`docker/embedding/bge-large-zh-v1.5` 模型文件约 1.3GB，未纳入 Git；首次运行前需从 Hugging Face 下载 `BAAI/bge-large-zh-v1.5` 到该目录。
+
+### 10.2 配置文件
+
+| 文件 | 内容 |
+| --- | --- |
+| `conf/app_config.yaml` | MySQL、Qdrant、ES、Embedding、LLM 连接配置 |
+| `conf/meta_config.yaml` | 表、字段、指标、别名、描述、值域同步开关 |
+| `.env` | `LLM_API_KEY`、`DB_PASSWORD`、`MYSQL_ROOT_PASSWORD`、`MYSQL_PASSWORD`（不入库） |
+| `docker/docker-compose.yaml` | 依赖服务和端口 |
+| `prompts/*.prompt` | 关键词扩展、过滤、SQL 生成与修正模板 |
+
+数据库业务账号通过 `docker-compose.yaml` 的 `MYSQL_USER` / `MYSQL_PASSWORD` 初始化，并同步配置到 `app_config.yaml`。密码不写入仓库：`.env.example` 只保留占位符，首次部署时复制为 `.env` 并填入实际密码。`app_config.yaml` 通过 `${oc.env:DB_PASSWORD}` 读取，`docker-compose.yaml` 通过 `${MYSQL_PASSWORD}` 读取，因此启动 Compose 时需要显式指定 `--env-file .env`。
+
+### 10.3 启动顺序
+
+```bash
+# 1. 启动依赖服务
+docker compose -p shopkeeper --env-file .env -f docker/docker-compose.yaml up -d
+
+# 2. 生成模拟数仓数据（首次或重建时执行）
+uv run python -m app.scripts.seed_guming_dw
+
+# 3. 构建元数据知识库（首次或修改元数据后执行）
+uv run python -m app.scripts.build_meta_knowledge -c conf/meta_config.yaml
+
+# 4. 启动后端
+uv run fastapi dev main.py --port 8000
+
+# 5. 启动前端
+cd frontend
+pnpm dev --host 127.0.0.1
+```
+
+前端默认运行在 `http://127.0.0.1:5173`，后端运行在 `http://127.0.0.1:8000`。
+
+---
+
+## 11. 工程问题与处理方式
+
+| 问题 | 现象 | 处理 |
+| --- | --- | --- |
+| 扇出重复计数 | 订单表 Join 明细表后 `SUM(actual_amount)` 被放大 | 拆分 GMV 和销售额指标；Prompt 强制明细维度使用 `item_amount` |
+| 召回上下文过长 | 三路召回结果直接拼给模型，Prompt 过大且噪声多 | 召回后增加表过滤和指标过滤，模型只做选择，程序负责裁剪 |
+| SQL 幻觉 | 编造字段、选错表、语法错误 | 只提供候选 Schema；`EXPLAIN` 校验；失败进入修正节点 |
+| 中文值域匹配 | “华东”“顶流茗星”用向量检索不稳定 | 低基数字段写入 ES，使用 IK 分词和 `match` 查询 |
+| 知识库重复构建 | 追加写导致向量点和元数据重复 | 重建前清空 Meta MySQL、Qdrant、ES 四类存储 |
+| 日期/金额序列化 | `date`、`Decimal` 无法直接 JSON 序列化 | 仓储层统一转换为字符串/数值 |
+| 中文分词噪声 | “的、帮我、一下”进入检索关键词 | Jieba 词性白名单 + 原始问题兜底 |
+| 数据不可复现 | 随机数据每次不同，无法对比实验结果 | 固定随机种子 `20250101`，脚本先 TRUNCATE 再插入 |
+| 并发日志追踪 | 多请求日志混在一起 | `ContextVar` 注入 request_id，loguru 统一输出 |
+
+---
+
+## 12. 验证结果
+
+### 12.1 知识库与数据基线
+
+| 检查项 | 结果 |
+| --- | --- |
+| Meta MySQL | 9 张表 / 71 个字段 / 16 个指标 / 45 条字段指标关系 |
+| Qdrant `column_info_collection` | 361 个向量点 |
+| Qdrant `metric_info_collection` | 89 个向量点 |
+| Elasticsearch `value_index` | 234 条取值文档 |
+| 数仓订单 | 48,409 |
+| 数仓订单明细 | 70,802 |
+| 全量 GMV | 1,308,418.15 元 |
+
+### 12.2 查询验证
+
+**按茗星等级统计订单量和客单价**
+
+| 茗星等级 | 订单量 | 客单价 |
+| --- | --- | --- |
+| 潜力茗星 | 17,752 | 28.82 |
+| 人气茗星 | 7,472 | 28.89 |
+| 当红茗星 | 3,465 | 28.81 |
+| 顶流茗星 | 866 | 27.80 |
+
+**各渠道订单量和 GMV 占比**
+
+| 渠道 | 订单量 | GMV | 订单量占比 | GMV 占比 |
+| --- | --- | --- | --- | --- |
+| 到店自提 | 20,340 | 583,494.95 | 44.75% | 44.60% |
+| 小程序外卖 | 11,436 | 329,036.60 | 25.16% | 25.15% |
+| 美团外卖 | 9,156 | 265,167.15 | 20.14% | 20.27% |
+| 饿了么外卖 | 4,522 | 130,719.45 | 9.95% | 9.99% |
+
+这两组结果同时验证了会员维度、渠道维度、金额口径、占比计算和两位小数处理。
+
+### 12.3 构建与前端验证
+
+- 知识库构建耗时约 40–51 秒；
+- 前端 `pnpm build` 通过，产物约 222 KB（gzip 69 KB）；
+- 页面可正常展示执行步骤、SQL 结果表格和错误信息；
+- 后端 `/docs` 可访问，`/api/query` 返回标准 SSE 事件流。
+
+---
+
+## 13. 局限与后续扩展
+
+### 13.1 当前局限
+
+- 只支持单轮问数，不保留会话上下文；
+- 只生成一条只读 SQL，不支持多语句和写入；
+- 结果是表格，没有图表和导出；
+- 指标数量固定为 16 个，新增指标需要更新配置并重建知识库；
+- 数仓结构变化后必须重新构建元数据知识库；
+- 没有用户权限、数据脱敏和 SQL 审计；
+- LLM 调用带来额外延迟和成本。
+
+### 13.2 可扩展方向
+
+| 方向 | 做法 |
+| --- | --- |
+| 多轮追问 | 在 State 中增加会话历史和指代消解节点 |
+| 结果可视化 | 根据结果列类型自动选择折线图、柱状图或饼图 |
+| SQL 安全 | 增加 SQL 审计、行数限制、超时和敏感字段脱敏 |
+| 查询缓存 | 对相同问题和相同时间范围缓存 SQL 与结果 |
+| 权限控制 | 按用户角色裁剪可访问的表、字段和行 |
+| 指标平台 | 把指标定义抽成独立语义层，支持版本管理 |
+| 反馈闭环 | 记录用户对 SQL 和结果的反馈，用于召回和 Prompt 优化 |
+
+---
+
+## 附录：目录结构
+
+```text
+goodme-data-agent/
+├── app/
+│   ├── agent/            # LangGraph 图、State、Context 和 12 个节点
+│   ├── api/              # FastAPI 路由、依赖注入、请求/响应结构
+│   ├── clients/          # MySQL、Qdrant、ES、Embedding 客户端管理
+│   ├── conf/             # 配置 dataclass 与加载逻辑
+│   ├── core/             # 日志、request_id 上下文
+│   ├── entities/         # 业务实体
+│   ├── models/           # SQLAlchemy ORM 模型
+│   ├── repositories/     # MySQL、Qdrant、ES 数据访问层
+│   ├── scripts/          # 数仓生成、知识库构建脚本
+│   └── services/         # 知识库构建与问数查询服务
+├── conf/                 # app_config.yaml、meta_config.yaml
+├── docker/               # Compose、MySQL 初始化 SQL、ES IK、Embedding 模型
+├── frontend/             # React + Vite + TypeScript + Tailwind CSS
+├── prompts/              # 关键词扩展、过滤、SQL 生成与修正模板
+├── main.py               # FastAPI 入口
+└── pyproject.toml        # Python 依赖与工具配置
+```
+
+
+---
+
+## 许可
+
+本项目代码采用 MIT 许可证，版权与许可声明见 [LICENSE](LICENSE)。

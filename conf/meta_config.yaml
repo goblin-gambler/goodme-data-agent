@@ -1,0 +1,592 @@
+# 古茗门店饮品零售场景的元数据配置
+# 表描述、字段描述和别名会直接影响 Schema RAG 的召回质量，尽量贴近业务同学的真实问法
+
+tables:
+  - name: dim_region
+    role: dim
+    description: 地区维度表，城市粒度。记录每个城市所属省份、城市等级和大区，用于门店归属和区域分析。
+    columns:
+      - name: region_id
+        role: primary_key
+        description: 区域编号，一个城市对应一条区域记录。
+        alias: [区域ID, 城市区域编号]
+        sync: false
+
+      - name: province
+        role: dimension
+        description: 省份名称，如浙江省、广东省。
+        alias: [省份, 省, 所在省份]
+        sync: true
+
+      - name: city
+        role: dimension
+        description: 城市名称，如杭州、上海、深圳。
+        alias: [城市, 所在城市, 市, 城市名称]
+        sync: true
+
+      - name: city_level
+        role: dimension
+        description: 城市等级，如一线、新一线、二线、三线。
+        alias: [城市等级, 城市级别, 几线城市]
+        sync: true
+
+      - name: region_name
+        role: dimension
+        description: 大区名称，如华东、华南、华中、西南、华北。
+        alias: [大区, 区域, 地区, 片区, 区域名称]
+        sync: true
+
+  - name: dim_store
+    role: dim
+    description: 门店维度表，一行一家古茗门店。记录门店名称、所属城市、经营类型、开业日期和营业状态。
+    columns:
+      - name: store_id
+        role: primary_key
+        description: 门店编号，门店维度的唯一标识。
+        alias: [门店ID, 店铺ID, 门店编号]
+        sync: false
+
+      - name: store_name
+        role: dimension
+        description: 门店名称，格式为“古茗(城市+商圈+店)”，如古茗(杭州西湖银泰店)。
+        alias: [门店, 店铺, 店名, 门店名称]
+        sync: true
+
+      - name: region_id
+        role: foreign_key
+        description: 门店所属区域编号，关联地区维度，用来定位城市和大区。
+        alias: [区域ID, 所属区域, 门店区域]
+        sync: false
+
+      - name: store_type
+        role: dimension
+        description: 门店经营类型，直营店或加盟店；古茗以加盟店为主，直营店仅用于品牌标杆。
+        alias: [经营类型, 门店类型, 直营店, 加盟店, 直营加盟]
+        sync: true
+
+      - name: open_date
+        role: dimension
+        description: 门店开业日期。
+        alias: [开业日期, 开店日期, 开业时间]
+        sync: false
+
+      - name: status
+        role: dimension
+        description: 门店状态，营业、闭店或筹备。统计在营门店时需要过滤 status='营业'。
+        alias: [门店状态, 营业状态, 经营状态]
+        sync: true
+
+      - name: area_sqm
+        role: measure
+        description: 门店营业面积，单位平方米。
+        alias: [面积, 门店面积, 营业面积]
+        sync: false
+
+  - name: dim_product
+    role: dim
+    description: 商品维度表，一行一个饮品 SKU。记录饮品名称、品类、系列、杯型、售价、成本和上市日期。
+    columns:
+      - name: product_id
+        role: primary_key
+        description: 商品编号，饮品 SKU 的唯一标识。
+        alias: [商品ID, 产品ID, 饮品ID]
+        sync: false
+
+      - name: product_name
+        role: dimension
+        description: 饮品名称，如超A芝士葡萄、杨枝甘露、云岭茉莉白。
+        alias: [商品名称, 产品名称, 饮品, 单品, 饮品名称]
+        sync: true
+
+      - name: category
+        role: dimension
+        description: 饮品品类，如鲜果茶、奶茶、轻乳茶、咖啡、纯茶。
+        alias: [品类, 商品类别, 饮品类别, 分类]
+        sync: true
+
+      - name: series
+        role: dimension
+        description: 产品系列/家族，如超A芝士家族、云岭茉莉家族、轻乳茶家族、鲜果茶家族、纯茶家族、咖啡家族、经典奶茶家族、季节限定。
+        alias: [系列, 产品系列, 商品系列, 产品线, 家族]
+        sync: true
+
+      - name: cup_size
+        role: dimension
+        description: 杯型规格，中杯或大杯。
+        alias: [杯型, 规格, 大小杯, 容量]
+        sync: true
+
+      - name: list_price
+        role: measure
+        description: 商品标准售价，即单杯原价，单位元。
+        alias: [售价, 原价, 标价, 单价]
+        sync: false
+
+      - name: cost_price
+        role: measure
+        description: 商品单位成本，单位元，用于计算毛利。
+        alias: [成本, 单杯成本, 成本价]
+        sync: false
+
+      - name: launch_date
+        role: dimension
+        description: 商品上市日期，判断新品时使用。
+        alias: [上市日期, 上架日期, 首发日期]
+        sync: false
+
+      - name: status
+        role: dimension
+        description: 商品状态，在售或下架。
+        alias: [商品状态, 上下架状态, 售卖状态]
+        sync: true
+
+  - name: dim_member
+    role: dim
+    description: 会员维度表，一行一位注册会员。记录会员性别、年龄段、会员等级、注册日期和注册门店。
+    columns:
+      - name: member_id
+        role: primary_key
+        description: 会员编号，会员维度的唯一标识。
+        alias: [会员ID, 用户ID, 会员卡号]
+        sync: false
+
+      - name: member_name
+        role: dimension
+        description: 会员姓名。
+        alias: [会员姓名, 姓名, 用户名]
+        sync: false
+
+      - name: gender
+        role: dimension
+        description: 会员性别，男、女或未知。
+        alias: [性别, 会员性别]
+        sync: true
+
+      - name: age_group
+        role: dimension
+        description: 会员年龄段，如18-24、25-30、31-40。
+        alias: [年龄段, 年龄区间, 年龄层]
+        sync: true
+
+      - name: member_level
+        role: dimension
+        description: 古茗茗星会员等级，分潜力茗星（S1）、人气茗星（S2）、当红茗星（S3）、顶流茗星（S4）；每月 1 日按上月获得的葫芦数结算，门槛依次为 3、8、20 个葫芦。
+        alias: [会员等级, 会员级别, 茗星等级, 茗星, 会员卡等级, S1, S2, S3, S4]
+        sync: true
+
+      - name: register_date
+        role: dimension
+        description: 会员注册日期。
+        alias: [注册日期, 入会日期, 开卡日期]
+        sync: false
+
+      - name: register_store_id
+        role: foreign_key
+        description: 会员注册时所在门店编号，关联门店维度。
+        alias: [注册门店, 开卡门店]
+        sync: false
+
+  - name: dim_channel
+    role: dim
+    description: 渠道维度表，记录到店自提和各类外卖渠道，以及渠道所属平台。
+    columns:
+      - name: channel_id
+        role: primary_key
+        description: 渠道编号。
+        alias: [渠道ID, 下单渠道编号]
+        sync: false
+
+      - name: channel_name
+        role: dimension
+        description: 下单渠道名称，如到店自提、小程序外卖、美团外卖、饿了么外卖。
+        alias: [渠道, 下单渠道, 订单渠道, 渠道名称]
+        sync: true
+
+      - name: channel_type
+        role: dimension
+        description: 渠道类型，到店或外卖。
+        alias: [渠道类型, 到店外卖, 消费场景]
+        sync: true
+
+      - name: platform
+        role: dimension
+        description: 渠道所属平台，如古茗小程序、美团、饿了么、门店。
+        alias: [平台, 下单平台, 来源平台]
+        sync: true
+
+  - name: dim_promotion
+    role: dim
+    description: 促销活动维度表，记录折扣、满减、第二杯半价、买一送一、特价和赠品活动的规则与生效时间。
+    columns:
+      - name: promotion_id
+        role: primary_key
+        description: 活动编号，促销活动的唯一标识。
+        alias: [活动ID, 促销ID, 优惠活动ID]
+        sync: false
+
+      - name: promotion_name
+        role: dimension
+        description: 促销活动名称，如周三会员日、第二杯半价、9.9元喝新品、情人节买一送一、葫芦兑好礼。
+        alias: [活动名称, 促销名称, 优惠活动]
+        sync: true
+
+      - name: promotion_type
+        role: dimension
+        description: 活动类型，折扣、满减、第二杯半价、买一送一、特价或赠品。
+        alias: [活动类型, 促销类型, 优惠类型]
+        sync: true
+
+      - name: start_date
+        role: dimension
+        description: 活动开始日期。
+        alias: [开始日期, 活动开始时间]
+        sync: false
+
+      - name: end_date
+        role: dimension
+        description: 活动结束日期。
+        alias: [结束日期, 活动结束时间]
+        sync: false
+
+      - name: discount_rate
+        role: measure
+        description: 折扣活动的折扣率，0.8 表示八折；非折扣活动为空。
+        alias: [折扣率, 折扣力度, 折扣]
+        sync: false
+
+      - name: threshold_amount
+        role: measure
+        description: 满减活动的消费门槛金额，单位元。
+        alias: [满减门槛, 消费门槛, 起减金额]
+        sync: false
+
+      - name: reduce_amount
+        role: measure
+        description: 满减活动的减免金额，单位元。
+        alias: [减免金额, 满减金额, 优惠金额]
+        sync: false
+
+  - name: dim_date
+    role: dim
+    description: 日期维度表，按天展开 2025 年第一季度，提供年、季度、月、星期和是否周末等分析口径。
+    columns:
+      - name: date_id
+        role: primary_key
+        description: 日期编号，格式 yyyyMMdd。
+        alias: [日期ID, 日期编号]
+        sync: false
+
+      - name: date
+        role: dimension
+        description: 业务日期。
+        alias: [日期, 业务日期, 交易日期]
+        sync: false
+
+      - name: year
+        role: dimension
+        description: 年份。
+        alias: [年, 年份]
+        sync: false
+
+      - name: quarter
+        role: dimension
+        description: 季度，如 Q1。
+        alias: [季度]
+        sync: true
+
+      - name: month
+        role: dimension
+        description: 月份，取值 1 到 12。
+        alias: [月, 月份]
+        sync: false
+
+      - name: day
+        role: dimension
+        description: 日，取值 1 到 31。
+        alias: [日, 天]
+        sync: false
+
+      - name: weekday
+        role: dimension
+        description: 星期几，1 表示周一，7 表示周日。
+        alias: [星期, 周几, 星期几]
+        sync: false
+
+      - name: weekday_name
+        role: dimension
+        description: 星期名称，如周一、周六。
+        alias: [星期名称, 周几名称]
+        sync: true
+
+      - name: is_weekend
+        role: dimension
+        description: 是否周末，1 表示是，0 表示否。
+        alias: [是否周末, 周末标记]
+        sync: false
+
+  - name: fact_order
+    role: fact
+    description: 订单事实表，一行一个订单。记录下单门店、会员、日期、渠道、活动、原价金额、优惠金额、实收金额、出杯数和订单状态。
+    columns:
+      - name: order_id
+        role: primary_key
+        description: 订单编号，订单事实的唯一标识。
+        alias: [订单ID, 订单编号, 单号]
+        sync: false
+
+      - name: store_id
+        role: foreign_key
+        description: 下单门店编号，关联门店维度。
+        alias: [门店ID, 下单门店, 所属门店]
+        sync: false
+
+      - name: member_id
+        role: foreign_key
+        description: 下单会员编号，关联会员维度；非会员下单时为空。
+        alias: [会员ID, 下单会员, 用户ID]
+        sync: false
+
+      - name: date_id
+        role: foreign_key
+        description: 下单日期编号，关联日期维度。
+        alias: [日期ID, 下单日期, 交易日期]
+        sync: false
+
+      - name: channel_id
+        role: foreign_key
+        description: 下单渠道编号，关联渠道维度。
+        alias: [渠道ID, 下单渠道]
+        sync: false
+
+      - name: promotion_id
+        role: foreign_key
+        description: 订单使用的促销活动编号，关联活动维度；未使用活动时为空。
+        alias: [活动ID, 促销ID, 使用的优惠]
+        sync: false
+
+      - name: order_amount
+        role: measure
+        description: 订单原价金额，即订单内商品原价合计，单位元。
+        alias: [原价金额, 应收金额, 订单原价]
+        sync: false
+
+      - name: discount_amount
+        role: measure
+        description: 订单优惠金额，单位元。
+        alias: [优惠金额, 折扣金额, 减免金额]
+        sync: false
+
+      - name: actual_amount
+        role: measure
+        description: 订单实收金额，等于原价金额减去优惠金额，单位元；退款和取消订单为 0。
+        alias: [实收金额, 实付金额, 成交金额]
+        sync: false
+
+      - name: item_count
+        role: measure
+        description: 订单出杯数，即订单内所有饮品数量合计。
+        alias: [杯数, 出杯量, 商品件数]
+        sync: false
+
+      - name: order_status
+        role: dimension
+        description: 订单状态，已完成、已退款或已取消。统计营收和销量时通常只保留已完成订单。
+        alias: [订单状态, 订单情况, 状态]
+        sync: true
+
+      - name: order_time
+        role: dimension
+        description: 下单时间，精确到秒。
+        alias: [下单时间, 订单时间, 交易时间]
+        sync: false
+
+  - name: fact_order_item
+    role: fact
+    description: 订单明细事实表，一行一个饮品 SKU。记录订单里每个饮品的杯数、单价、金额、糖度、冰量和小料。
+    columns:
+      - name: order_item_id
+        role: primary_key
+        description: 订单明细编号。
+        alias: [明细ID, 订单明细编号]
+        sync: false
+
+      - name: order_id
+        role: foreign_key
+        description: 所属订单编号，关联订单事实表。
+        alias: [订单ID, 所属订单]
+        sync: false
+
+      - name: product_id
+        role: foreign_key
+        description: 商品编号，关联商品维度。
+        alias: [商品ID, 饮品ID]
+        sync: false
+
+      - name: quantity
+        role: measure
+        description: 该商品购买杯数。
+        alias: [数量, 杯数, 购买数量]
+        sync: false
+
+      - name: unit_price
+        role: measure
+        description: 该商品单杯售价，单位元。
+        alias: [单价, 售价, 单杯价格]
+        sync: false
+
+      - name: item_amount
+        role: measure
+        description: 明细金额，等于杯数乘以单价再加上小料金额，单位元。
+        alias: [明细金额, 商品金额, 小计]
+        sync: false
+
+      - name: sugar_level
+        role: dimension
+        description: 糖度，古茗点单口径为十分甜、七分甜、五分甜、三分甜、微糖；七分甜是默认甜度，微糖即不另外加糖。
+        alias: [糖度, 甜度, 糖分, 几分甜, 甜度选项]
+        sync: true
+
+      - name: ice_level
+        role: dimension
+        description: 冰量/温度，古茗点单口径为正常冰、少冰、去冰、温、热。
+        alias: [冰量, 温度, 冰度, 冷热, 冰量选项]
+        sync: true
+
+      - name: topping
+        role: dimension
+        description: 小料名称，如无、珍珠、椰果、多肉、芋圆、芋泥、奶盖、西米。
+        alias: [小料, 加料, 配料, 加料选项]
+        sync: true
+
+      - name: topping_amount
+        role: measure
+        description: 小料加价金额，单位元。
+        alias: [小料金额, 加料费用]
+        sync: false
+
+
+metrics:
+  - name: GMV
+    description: 统计期内所有已完成订单（order_status='已完成'）的实收金额 actual_amount 合计，单位元；已退款和已取消订单不计入。按订单、门店、大区等订单维度统计整体营收时使用。
+    relevant_columns:
+      - fact_order.actual_amount
+      - fact_order.order_status
+    alias: [成交总额, 成交金额, 交易总额, GMV]
+
+  - name: 销售额
+    description: 统计期内已完成订单的订单明细金额 fact_order_item.item_amount 合计，单位元，属于优惠前金额。按饮品、品类等明细维度统计销售额时必须使用该口径，避免把订单级金额和明细表 JOIN 后重复计数。
+    relevant_columns:
+      - fact_order_item.item_amount
+      - fact_order.order_status
+    alias: [销售额, 营业额, 销售金额, 商品销售额, 饮品销售额]
+
+  - name: 订单量
+    description: 统计期内已完成订单的数量，即 order_status='已完成' 的订单编号去重计数。
+    relevant_columns:
+      - fact_order.order_id
+      - fact_order.order_status
+    alias: [订单数, 订单数量, 单量, 成交单数]
+
+  - name: 客单价
+    description: 客单价等于 GMV（已完成订单的实收金额合计）除以已完成订单量，单位元/单。
+    relevant_columns:
+      - fact_order.actual_amount
+      - fact_order.order_id
+      - fact_order.order_status
+    alias: [平均订单金额, 平均客单价, AOV, 单均消费]
+
+  - name: 出杯量
+    description: 统计期内已完成订单的饮品杯数合计，可用 fact_order.item_count 求和，也可用 fact_order_item.quantity 求和。
+    relevant_columns:
+      - fact_order.item_count
+      - fact_order_item.quantity
+      - fact_order.order_status
+    alias: [销量, 杯数, 售出杯数, 出杯数]
+
+  - name: 杯单价
+    description: 杯单价等于 GMV 除以出杯量，单位元/杯。
+    relevant_columns:
+      - fact_order.actual_amount
+      - fact_order.item_count
+      - fact_order.order_status
+    alias: [每杯价格, 单杯价格, 杯均价格]
+
+  - name: 折扣金额
+    description: 统计期内已完成订单的优惠金额 discount_amount 合计，单位元。
+    relevant_columns:
+      - fact_order.discount_amount
+      - fact_order.order_status
+    alias: [优惠金额, 让利金额, 折扣总额]
+
+  - name: 折扣率
+    description: 折扣率等于已完成订单的优惠金额合计除以订单原价金额 order_amount 合计。
+    relevant_columns:
+      - fact_order.discount_amount
+      - fact_order.order_amount
+      - fact_order.order_status
+    alias: [优惠率, 折扣力度, 让利率]
+
+  - name: 会员订单占比
+    description: 会员订单占比等于会员下单（member_id 非空）的已完成订单数除以全部已完成订单数。
+    relevant_columns:
+      - fact_order.member_id
+      - fact_order.order_id
+      - fact_order.order_status
+    alias: [会员订单比例, 会员渗透率, 会员消费占比]
+
+  - name: 会员复购率
+    description: 统计期内下单两次及以上的会员数除以统计期内有过下单的会员数；只统计已完成订单且 member_id 非空。
+    relevant_columns:
+      - fact_order.member_id
+      - fact_order.order_id
+      - fact_order.order_status
+    alias: [复购率, 会员复购, 重复购买率]
+
+  - name: 单店日均营收
+    description: 单店日均营收等于 GMV 除以产生订单的门店数，再除以统计天数，单位元/店/天。
+    relevant_columns:
+      - fact_order.actual_amount
+      - fact_order.store_id
+      - fact_order.date_id
+      - fact_order.order_status
+    alias: [店均日营收, 单店日均销售额, 门店日均营业额]
+
+  - name: 新品销量占比
+    description: 新品销量占比等于新品（上市日期 launch_date 在统计期内）的饮品杯量除以全部饮品杯量；杯量按已完成订单的 fact_order_item.quantity 汇总。
+    relevant_columns:
+      - dim_product.launch_date
+      - fact_order_item.quantity
+      - fact_order.order_status
+    alias: [新品占比, 新品销量比例, 新品贡献率]
+
+  - name: 退款率
+    description: 退款率等于已退款订单数除以全部订单数（包含已完成、已退款和已取消）。
+    relevant_columns:
+      - fact_order.order_id
+      - fact_order.order_status
+    alias: [退单率, 退款订单占比, 退货率]
+
+  - name: 毛利率
+    description: 毛利率等于（已完成订单实收金额 - 商品成本）除以实收金额；商品成本按 fact_order_item.quantity 乘以 dim_product.cost_price 汇总。
+    relevant_columns:
+      - fact_order.actual_amount
+      - fact_order_item.quantity
+      - dim_product.cost_price
+      - fact_order.order_status
+    alias: [毛利占比, 毛利率水平, 商品毛利率]
+
+  - name: 营业门店数
+    description: 统计期内产生过已完成订单的门店去重数量；若用户问在营门店总数，则统计 dim_store.status='营业' 的门店数。
+    relevant_columns:
+      - fact_order.store_id
+      - fact_order.order_status
+      - dim_store.store_id
+      - dim_store.status
+    alias: [门店数量, 门店数, 营业门店数, 在营门店数]
+
+  - name: 消费会员数
+    description: 统计期内产生过已完成订单的会员去重数量。
+    relevant_columns:
+      - fact_order.member_id
+      - fact_order.order_status
+    alias: [会员数, 会员数量, 下单会员数, 活跃会员数, 消费会员数]

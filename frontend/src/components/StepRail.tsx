@@ -90,11 +90,11 @@ function FlowNodeCard({ node, status }: { node: FlowNode; status: FlowStatus }) 
     >
       <div
         className={cn(
-          "flex h-10 items-center gap-2 border px-3 text-sm font-semibold shadow-line transition",
-          status === "pending" && "border-ink/10 bg-white/55 text-ink/45",
-          status === "running" && "border-brass/45 bg-brass/15 text-ink",
-          status === "success" && "border-moss/25 bg-moss/10 text-ink",
-          status === "error" && "border-tomato/35 bg-tomato/10 text-tomato",
+          "flex h-10 items-center gap-2 border px-3 text-sm font-semibold transition",
+          status === "pending" && "border-ink/10 bg-white/40 text-ink/40",
+          status === "running" && "border-brass/60 bg-brass/10 text-ink",
+          status === "success" && "border-moss/35 bg-moss/10 text-ink",
+          status === "error" && "border-tomato/40 bg-tomato/10 text-tomato",
         )}
       >
         <span
@@ -120,10 +120,10 @@ export function StepRail({ steps = [] }: { steps?: StepState[] }) {
   const statusMap = getStatusMap(steps);
 
   return (
-    <section className="mt-4 border border-ink/10 bg-white/40 px-3 py-4 shadow-line">
-      <div className="mb-3 flex items-center justify-between gap-3 px-1">
-        <div className="text-sm font-semibold text-ink">执行流程</div>
-        <div className="text-xs text-ink/45">LangGraph</div>
+    <section className="mt-5 border border-ink/10 bg-[#fffdf8]/45 px-3 py-4">
+      <div className="mb-3 flex items-center justify-between gap-3 border-b border-ink/10 px-1 pb-2">
+        <div className="font-serif text-sm tracking-[0.08em] text-ink">执行流程</div>
+        <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-ink/40">LangGraph</div>
       </div>
 
       <div className="overflow-x-auto">
